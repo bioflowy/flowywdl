@@ -1,0 +1,12 @@
+{
+  "tasks": {
+    "dev": "deno run --watch -A main.ts"
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@1",
+    "antlr4ng": "npm:/antlr4ng",
+    "chevrotain": "npm:/chevrotain",
+    "typescript-parsec": "npm:/typescript-parsec",
+    "io/types.ts": "https://deno.land/std@0.200.0/io/types.ts"
+  }
+}
