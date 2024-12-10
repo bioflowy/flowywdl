@@ -1,5 +1,216 @@
 import { encode as base32Encode } from "https://deno.land/std@0.201.0/encoding/base32.ts";
 import { BadCharacterEncoding,SourcePosition } from "./error.ts";
+import { lstat, mkdirsSync, mkdirSync, path,symlink, unlink, writeFileSync } from "./runtimeutils.ts";
+import * as Value from './value.ts'
+import * as Tree from './tree.ts'
+import * as Type from './type.ts'
+import * as Env from './env.ts'
+import { existsSync } from "./runtimeutils.ts";
+/**
+ * Creates a directory for a run with timestamp-based naming.
+ * @param name Base name for the run directory
+ * @param parentDir Parent directory path (optional)
+ * @param lastLink Whether to create/update a _LAST symlink (default: false)
+ * @returns The absolute path to the created run directory
+ */
+export async function provisionRunDir(
+    name: string,
+    parentDir: string | null = null,
+    lastLink: boolean = false
+): Promise<string> {
+    const here = parentDir
+        ? (parentDir === "." || parentDir === "./" || 
+           parentDir.endsWith("/.") || parentDir.endsWith("/./"))
+        : false;
+
+    parentDir = path.resolve(parentDir || Deno.cwd());
+
+    let runDir: string | null = null;
+    if (here) {
+        // user wants to use parentDir exactly
+        runDir = parentDir;
+        mkdirsSync(runDir);
+        parentDir = path.dirname(parentDir);
+    } else {
+        // create timestamp-named directory
+        while (!runDir) {
+            const timestamp = new Date().toISOString()
+                .replace(/[-:]/g, "")
+                .replace(/[T.]/g, "_")
+                .split("_")[0] + "_" + 
+                new Date().toTimeString().split(" ")[0].replace(/:/g, "");
+            
+            runDir = path.join(parentDir, `${timestamp}_${name}`);
+            
+            try {
+                await Deno.mkdir(runDir,{recursive:true});
+                console.log(`created ${runDir}`)
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+                    runDir = null;
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                } else {
+                    throw error;
+                }
+            }
+        }
+    }
+
+    if (!runDir) {
+        throw new Error("Failed to create run directory");
+    }
+
+    // update the _LAST link
+    if (lastLink && runDir !== parentDir) {
+        const lastLinkName = path.join(parentDir, "_LAST");
+        try {
+            const stats = await lstat(lastLinkName);
+            if (stats.isSymlink) {
+                await unlink(lastLinkName);
+            }
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw error;
+            }
+        }        
+        
+        await symlink(path.basename(runDir), lastLinkName);
+    }
+
+    return runDir;
+}
+export function writeValuesJson(
+    valuesEnv: any,  // Type for Env.Bindings[Value.Base]
+    filename: string, 
+    namespace: string = ""
+): void {
+    writeFileSync(filename,JSON.stringify(
+        valuesToJson(valuesEnv,  namespace),
+        null,
+        2
+    ),
+    )
+}
+
+export function valuesToJson(
+    valuesEnv: Env.Bindings<Value.Base | Tree.Decl | Type.Base>,
+    namespace: string = ""
+): { [key: string]: any } {
+    /**
+     * Convert a WDL.Env.Bindings[WDL.Value.Base] to a dict which JSON.stringify to
+     * Cromwell-style JSON.
+     * 
+     * @param namespace prefix this namespace to each key (e.g. workflow name)
+     */
+    // also can be used on Env.Bindings[Tree.Decl] or Env.Types, then the right-hand side of
+    // each entry will be the type string.
+    
+    if (namespace && !namespace.endsWith(".")) {
+        namespace += ".";
+    }
+
+    const ans: { [key: string]: any } = {};
+    
+    for (const item of valuesEnv) {
+        const v = item.value;
+        let j: any;
+        
+        if (v instanceof Value.Base) {
+            j = v.json;
+        } else if (v instanceof Tree.Decl) {
+            j = String(v.type);
+        } else {
+            if (!(v instanceof Type.Base)) {
+                throw new Error("Invalid value type");
+            }
+            j = String(v);
+        }
+        
+        ans[(item.name.startsWith("_") ? "" : namespace) + item.name] = j;
+    }
+    
+    return ans;
+}
+
+/**
+ * Helper function to force create a symlink by removing existing one if necessary
+ */
+export async function symlinkForce(target: string, linkPath: string): Promise<void> {
+    try {
+        await unlink(linkPath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error;
+        }
+    }
+    await symlink(target, linkPath);
+}
+/**
+ * Helper function to force create a symlink by removing existing one if necessary
+ */
+export async function linkForce(target: string, linkPath: string): Promise<void> {
+    try {
+        await unlink(linkPath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error;
+        }
+    }
+    await Deno.linkSync(target, linkPath);
+}
+
+const byteSizeUnits: { [key: string]: number } = {
+    'K': 1024,
+    'KB': 1024,
+    'KiB': 1024,
+    'M': 1024 * 1024,
+    'MB': 1024 * 1024,
+    'MiB': 1024 * 1024,
+    'G': 1024 * 1024 * 1024,
+    'GB': 1024 * 1024 * 1024,
+    'GiB': 1024 * 1024 * 1024,
+    'T': 1024 * 1024 * 1024 * 1024,
+    'TB': 1024 * 1024 * 1024 * 1024,
+    'TiB': 1024 * 1024 * 1024 * 1024,
+  };
+  
+  /**
+   * "2000", "4G", "1.5 TiB" などの文字列をバイト数に変換する
+   * @param s バイトサイズを表す文字列
+   * @returns バイト数
+   * @throws 無効な形式の場合はエラー
+   */
+export function parseByteSize(s: string): number {
+    s = s.trim();
+    let N: number | null = null;
+    let unit: string | null = null;
+  
+    // 数値部分と単位部分を分離
+    for (let i = 0; i < s.length; i++) {
+      if (s[i].match(/[\d.]/) !== null) {
+        N = parseFloat(s.slice(0, i + 1));
+        unit = s.slice(i + 1).trim();
+      } else {
+        break;
+      }
+    }
+  
+    // 値と単位の検証と変換
+    if (N !== null && unit) {
+      if (unit in byteSizeUnits) {
+        N *= byteSizeUnits[unit];
+      } else {
+        N = null;
+      }
+    }
+  
+    // エラーチェック
+    if (N === null || N < 0) {
+      throw new Error(`invalid byte size string, ${s}`);
+    }
+  
+    return Math.floor(N);
+  }
 export async function calcSHA256(text: string): Promise<string> {
     const encoder = new TextEncoder();
     const data = encoder.encode(text);
@@ -12,6 +223,7 @@ export async function calcSHA256(text: string): Promise<string> {
     const base32Hash = base32Encode(Uint8Array.from(hashArray));
     return base32Hash;
 }
+
 export interface Writer {
     write(text: string): Promise<void>;
     close(): Promise<void>;

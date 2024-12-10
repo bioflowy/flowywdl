@@ -60,11 +60,11 @@ export abstract class Base extends WDLError.SourceNode {
         return this;
     }
 
-    abstract _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.Base;
+    abstract _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.Base>;
 
-    eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.Base {
+    async eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.Base> {
         try {
-            const result = this._eval(env, stdlib);
+            const result = await this._eval(env, stdlib);
             result.expr = this;
             return result;
         } catch (ex) {
@@ -94,8 +94,8 @@ export class BooleanLiteral extends Base {
         return new Type.Boolean();
     }
 
-    _eval(_: Env.Bindings<Value.Base>, __: StdLib.Base): Value.Boolean {
-        return new Value.Boolean(this.value);
+    _eval(_: Env.Bindings<Value.Base>, __: StdLib.Base): Promise<Value.Boolean> {
+        return Promise.resolve(new Value.Boolean(this.value));
     }
 
     override toString(): string {
@@ -119,8 +119,8 @@ export class IntLiteral extends Base {
         return new Type.Int();
     }
 
-    _eval(_: Env.Bindings<Value.Base>, __: StdLib.Base): Value.Int {
-        return new Value.Int(this.value);
+    _eval(_: Env.Bindings<Value.Base>, __: StdLib.Base): Promise<Value.Int> {
+        return Promise.resolve(new Value.Int(this.value));
     }
 
     override toString(): string {
@@ -145,8 +145,8 @@ export class FloatLiteral extends Base {
         return new Type.Float();
     }
 
-    _eval(_: Env.Bindings<Value.Base>, __: StdLib.Base): Value.Float {
-        return new Value.Float(this.value);
+    _eval(_: Env.Bindings<Value.Base>, __: StdLib.Base): Promise<Value.Float> {
+        return Promise.resolve(new Value.Float(this.value));
     }
 
     override toString(): string {
@@ -197,11 +197,12 @@ export class String extends Base {
         return new Type.String();
     }
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.String {
+    async _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.String> {
         const ans: string[] = [];
         for (const part of this.parts) {
             if (part instanceof Placeholder) {
-                ans.push(part.eval(env, stdlib).value as string); // evaluate interpolated expression & stringify
+                const rslt = await part.eval(env, stdlib)
+                ans.push(rslt.value as string); // evaluate interpolated expression & stringify
             } else if (typeof part === "string") {
                 if (this.command) {
                     ans.push(part);
@@ -228,36 +229,133 @@ export class String extends Base {
 
     override get literal(): Value.Base | null {
         if (this.parts.some((p) => !(typeof p === "string"))) return null;
-        return this._eval(new Env.Bindings(), new StdLib.Base()); // type assertion due to partial nullability
+        return new Value.String(this.parts.join(),this)
     }
 }
-
+let placeholderRe:RegExp|undefined = undefined;
+export function setPlaceholderRegex(regex:RegExp|undefined){
+    placeholderRe = regex
+}
 export class Placeholder extends Base {
+    /**
+     * Holds an expression interpolated within a string or command
+     */
+
+    /**
+     * Placeholder options (sep, true, false, default)
+     */
     options: { [key: string]: string };
+
+    /**
+     * Expression to be evaluated and substituted
+     */
     expr: Base;
 
     constructor(pos: WDLError.SourcePosition, options: { [key: string]: string }, expr: Base) {
         super(pos);
         this.options = options;
         this.expr = expr;
-    }
 
-    _infer_type(_: Env.Bindings<Type.Base>): Type.Base {
-        // Logic to infer the type based on the presence of "sep", "true", and "false" options
-        return new Type.String();
-    }
+        // preprocess expr to rewrite any Apply("_add") to Apply("_interpolation_add") for the
+        // special interpolation-only behavior of + for String? operands.
+        const rewriteAdds = (ch: Base): void => {
+            if (ch instanceof Apply && ch.function_name === "_add") {
+                ch.function_name = "_interpolation_add";
+            }
+            for (const ch2 of ch.children) {
+                if (ch2 instanceof Base) {
+                    rewriteAdds(ch2);
+                }
+            }
+        };
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.String {
-        const evaluatedValue = this.expr.eval(env, stdlib);
-        return new Value.String(evaluatedValue.toString());
+        rewriteAdds(this.expr);
     }
 
     override toString(): string {
-        return `~{${this.expr.toString()}}`;
+        const options: string[] = [];
+        for (const option in this.options) {
+            options.push(`${option}="${this.options[option]}"`);
+        }
+        options.push(this.expr.toString());
+        return `~{${options.join(" ")}}`;
     }
 
-    override get children(): Iterable<Base> {
+    override get children(): Iterable<Base>  {
         return [this.expr];
+    }
+
+     _infer_type(type_env: Env.Bindings<Type.Base>): Type.Base {
+        if (this.expr.type instanceof Type.WDLArray) {
+            if (!("sep" in this.options)) {
+                throw new WDLError.IncompatibleOperand(
+                    this,
+                    "provide `sep'arator string to interpolate array items"
+                );
+            }
+        } else if ("sep" in this.options) {
+            throw new WDLError.StaticTypeMismatch(
+                this,
+                new Type.WDLArray(new Type.Any()),
+                this.expr.type,
+                "command placeholder has 'sep' option for non-Array expression"
+            );
+        }
+        
+        if ("true" in this.options || "false" in this.options) {
+            if (!(this.expr.type instanceof Type.Boolean)) {
+                throw new WDLError.StaticTypeMismatch(
+                    this,
+                    new Type.Boolean(),
+                    this.expr.type,
+                    "command placeholder 'true' and 'false' options used with non-Boolean expression"
+                );
+            }
+            if (!("true" in this.options && "false" in this.options)) {
+                throw new WDLError.StaticTypeMismatch(
+                    this,
+                    new Type.Boolean(),
+                    this.expr.type,
+                    "command placeholder with only one of 'true' and 'false' options"
+                );
+            }
+        }
+        return new Type.String();
+    }
+
+    async _eval_impl(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.String> {
+        const v = await this.expr.eval(env, stdlib);
+        if (v instanceof Value.Null) {
+            if ("default" in this.options) {
+                return new Value.String(this.options["default"]);
+            }
+            return new Value.String("");
+        }
+        if (v instanceof Value.String) {
+            return v;
+        }
+        if (v instanceof Value.WDLArray) {
+            return new Value.String(
+                v.value.map(item => item.coerce(new Type.String()).value).join(this.options["sep"])
+            );
+        }
+        if ((v instanceof Value.Boolean) && v.value && "true" in this.options) {
+            return new Value.String(this.options["true"]);
+        }
+        if ((v instanceof Value.Boolean) && v.value == false && "false" in this.options) {
+            return new Value.String(this.options["false"]);
+        }
+        return new Value.String(v.toString());
+    }
+
+    async _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.String> {
+        const ans = await this._eval_impl(env, stdlib);
+        if(placeholderRe && !(ans.value as string).matchAll(placeholderRe)){
+            throw new WDLError.InputError(
+                "Task command placeholder value forbidden by configuration [task_runtime] placeholder_regex"
+            )
+        }
+        return ans;
     }
 }
 export class Array extends Base {
@@ -304,12 +402,17 @@ export class Array extends Base {
         return super.typecheck(expected);
     }
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.WDLArray {
+    async _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.WDLArray> {
         if (!(this.type instanceof Type.WDLArray)) throw new Error("Type mismatch");
         const itemType = this.type.itemType;
+        const values:Value.Base[] = []
+        for(const item of this.items){
+            const r = await item.eval(env, stdlib)
+            values.push(r.coerce(itemType))
+        }
         return new Value.WDLArray(
             itemType,
-            this.items.map((item) => item.eval(env, stdlib).coerce(itemType))
+            values
         );
     }
 
@@ -398,16 +501,17 @@ export class Map extends Base {
 
         return new Type.Map([kty, vty],false,  literal_keys);
     }
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base):Value.Base{
+    async _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base):Promise<Value.Base>{
     const keystrs = new Set()
     const eitems:[Value.Base,Value.Base][] = []
     for(const [ k, v ] of this.items){
-        const ek = k.eval(env, stdlib)
+        const ek = await k.eval(env, stdlib)
         const sk = ek.toString
         if(keystrs.has(sk)){
             throw new WDLError.EvalError(this, "duplicate keys in Map literal")
         }
-        eitems.push([ek, v.eval(env, stdlib)])
+        const rslt = await v.eval(env, stdlib)
+        eitems.push([ek, rslt])
         keystrs.add(sk)
     }
     const itemType = (this.type as Type.Map).itemType
@@ -466,8 +570,8 @@ export class Ident extends Base {
         return ans;
     }
 
-    _eval(env: Env.Bindings<Value.Base>, _: StdLib.Base): Value.Base {
-        return env.resolve(this.name);
+    _eval(env: Env.Bindings<Value.Base>, _: StdLib.Base): Promise<Value.Base> {
+        return Promise.resolve(env.resolve(this.name));
     }
 
     get _ident(): string {
@@ -495,7 +599,7 @@ export class LeftName extends Base {
         throw new Error("NotImplementedError");
     }
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.Base {
+    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.Base> {
         throw new Error("NotImplementedError");
     }
 
@@ -599,7 +703,7 @@ export class Struct extends Base {
         return struct_type;
     }
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.Base {
+    async _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.Base> {
         if (!(this.type instanceof Type.WDLObject) && 
             !(this.type instanceof Type.StructInstance)) {
             throw new Error("Expected Object or StructInstance type");
@@ -608,7 +712,7 @@ export class Struct extends Base {
         const ans: { [key: string]: Value.Base } = {};
         
         for (const [key, value] of Object.entries(this.members)) {
-            ans[key] = value.eval(env, stdlib);
+            ans[key] = await value.eval(env, stdlib);
             
             if (this.type instanceof Type.StructInstance) {
                 if (!this.type.members) {
@@ -680,7 +784,10 @@ export class Get extends Base {
         }
 
         try {
-            this.expr._infer_type(type_env);
+            if(this._stdlib === undefined){
+                throw new Error("unexpected")
+            }
+            this.expr.inferType(type_env,this._stdlib,this._check_quant);
         } catch (err) {
             if (!(this.expr instanceof LeftName || this.expr instanceof Get) || !this.expr._ident || !this.member) {
                 throw err;
@@ -721,16 +828,16 @@ export class Get extends Base {
         throw new WDLError.NoSuchMember(this, this.member);
     }
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.Base {
+    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.Base> {
         const innard_value = this.expr._eval(env, stdlib);
         if (!this.member) {
             return innard_value;
         }
         if (innard_value instanceof Value.Pair) {
-            return innard_value.value[this.member === "left" ? 0 : 1];
+            return Promise.resolve(innard_value.value[this.member === "left" ? 0 : 1]);
         }
         if (innard_value instanceof Value.Struct && this.member in innard_value.value) {
-            return innard_value.value[this.member];
+            return Promise.resolve(innard_value.value[this.member]);
         }
         throw new Error("NotImplementedError");
     }
@@ -777,12 +884,12 @@ export class Pair extends Base {
         return new Type.Pair(this.left.type, this.right.type);
     }
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.Base {
+    async _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.Base> {
         if (!(this.type instanceof Type.Pair)) {
             throw new Error("Expected Pair type");
         }
-        const lv = this.left.eval(env, stdlib);
-        const rv = this.right.eval(env, stdlib);
+        const lv = await this.left.eval(env, stdlib);
+        const rv = await this.right.eval(env, stdlib);
         return new Value.Pair(this.left.type, this.right.type, [lv, rv]);
     }
 
@@ -855,8 +962,9 @@ export class IfThenElse extends Base {
         return ty;
     }
 
-    override _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.Base {
-        if (this.condition.eval(env, stdlib).expect(new Type.Boolean()).value) {
+    override async _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.Base> {
+        const rslt = await this.condition.eval(env, stdlib)
+        if (rslt.expect(new Type.Boolean()).value) {
             return this.consequent.eval(env, stdlib);
         } else {
             return this.alternative.eval(env, stdlib);
@@ -878,13 +986,16 @@ export class StringLiteral extends Base {
         return new Type.String();
     }
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.String {
+    async _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.String> {
         let result = '';
         for (const part of this.parts) {
             if (typeof part === 'string') result += part;
-            else result += part.eval(env, stdlib).value;
+            else{ 
+                const rslt = await part.eval(env, stdlib)
+                result += rslt.value;
+            }
         }
-        return new Value.String(result);
+        return Promise.resolve(new Value.String(result));
     }
 
     override toString(): string {
@@ -916,8 +1027,8 @@ export class Null extends Base{
         return new Type.Any(false,true)
     }
 
-    _eval(_: Env.Bindings<Value.Base>, _2: StdLib.Base) :Value.Null{
-        return new Value.Null()
+    _eval(_: Env.Bindings<Value.Base>, _2: StdLib.Base) :Promise<Value.Null>{
+        return Promise.resolve(new Value.Null())
     }
     override get children(): Iterable<WDLError.SourceNode> {
         return []
@@ -1020,9 +1131,9 @@ export class Apply extends Base {
         return f.inferType(this);
     }
 
-    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Value.Base {
+    _eval(env: Env.Bindings<Value.Base>, stdlib: StdLib.Base): Promise<Value.Base> {
         const f = stdlib.getFunction(this.function_name);
-        if (!(f instanceof StdLib.WDLFunction)) throw new Error("Type mismatch");
+        if (!(f instanceof StdLib.WDLFunction)) throw new Error(`Type mismatch ${this.function_name} ${f}`);
         return f.call(this, env, stdlib);
     }
 }

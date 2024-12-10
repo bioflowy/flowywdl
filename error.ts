@@ -124,12 +124,14 @@ export class NoSuchMember extends ValidationError {
 }
 
 export class StaticTypeMismatch extends ValidationError {
+    override node: SourceNode;
     expected: Base;
     actual: Base;
     override message: string;
 
     constructor(node: SourceNode, expected: Base, actual: Base, message = '') {
         super(node, message);
+        this.node = node;
         this.expected = expected;
         this.actual = actual;
         this.message = message;
@@ -201,32 +203,39 @@ export class MultipleValidationErrors extends Error {
     }
 }
 
-class MultiContext {
-    private exceptions: (ValidationError | MultipleValidationErrors)[] = [];
+export class MultiContext {
+    private _exceptions: Array<ValidationError | MultipleValidationErrors>;
 
-    try1(fn: () => any): any | null {
+    constructor() {
+        this._exceptions = [];
+    }
+
+    try1<T>(fn: () => T): T | null {
         try {
             return fn();
-        } catch (ex) {
-            if (ex instanceof ValidationError || ex instanceof MultipleValidationErrors) {
-                this.exceptions.push(ex);
+        } catch (exn) {
+            if (exn instanceof ValidationError || exn instanceof MultipleValidationErrors) {
+                this._exceptions.push(exn);
                 return null;
-            } else {
-                throw ex;
             }
+            throw exn;
         }
     }
 
-    append(ex: ValidationError | MultipleValidationErrors): void {
-        this.exceptions.push(ex);
+    append(exn: ValidationError | MultipleValidationErrors): void {
+        this._exceptions.push(exn);
     }
 
     maybeRaise(): void {
-        if (this.exceptions.length === 1) throw this.exceptions[0];
-        if (this.exceptions.length > 0) throw new MultipleValidationErrors(...this.exceptions);
+        if (this._exceptions.length === 1) {
+            throw this._exceptions[0];
+        }
+        if (this._exceptions.length > 0) {
+            // TypeScriptでは'from'句は存在しないため、元のエラーはスタックトレースに含まれます
+            throw new MultipleValidationErrors(...this._exceptions);
+        }
     }
 }
-
 export async function multiContext(fn: (ctx: MultiContext) => any): Promise<void> {
     const ctx = new MultiContext();
     await fn(ctx);

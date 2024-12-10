@@ -68,18 +68,23 @@ export class TaskOutputs extends Base {
 // Abstract interface to a standard library function implementation
 export abstract class WDLFunction {
     abstract inferType(expr: Expr.Apply): Type.Base;
-    abstract call(expr: Expr.Apply, env: Env.Bindings<Value.Base>, stdlib: Base): Value.Base;
+    abstract call(expr: Expr.Apply, env: Env.Bindings<Value.Base>, stdlib: Base): Promise<Value.Base>;
 }
 
 abstract class EagerFunction extends WDLFunction {
-    abstract _callEager(expr: Expr.Apply, args: Value.Base[]): Value.Base;
+    abstract _callEager(expr: Expr.Apply, args: Value.Base[]): Promise<Value.Base>;
 
-    call(expr: Expr.Apply, env: Env.Bindings<Value.Base>, stdlib: Base): Value.Base {
-        return this._callEager(expr, expr.arguments.map(arg => arg.eval(env,  stdlib )));
+    async call(expr: Expr.Apply, env: Env.Bindings<Value.Base>, stdlib: Base): Promise<Value.Base> {
+        const args:Value.Base[] = []
+        for(const arg of expr.arguments){
+            const rslt = await arg.eval(env,stdlib)
+            args.push(rslt)
+        }
+        return this._callEager(expr, args);
     }
 }
 
-class StaticFunction extends EagerFunction {
+export class StaticFunction extends EagerFunction {
     name: string;
     argumentTypes: Type.Base[];
     returnType: Type.Base;
@@ -129,10 +134,10 @@ class StaticFunction extends EagerFunction {
         return this.returnType;
     }
 
-    _callEager(expr: Expr.Apply, args: Value.Base[]): Value.Base {
+    async _callEager(expr: Expr.Apply, args: Value.Base[]): Promise<Value.Base> {
         const argumentValues = args.map((arg, i) => arg.coerce(this.argumentTypes[i]));
         try {
-            const ans: Value.Base = this.F(...argumentValues);
+            const ans: Value.Base = await this.F(...argumentValues);
             return ans.coerce(this.returnType);
         } catch (e) {
             let msg = "function evaluation failed";
@@ -194,7 +199,7 @@ class _At extends EagerFunction {
         throw new WDLError.NotAnArray(lhs);
     }
 
-    _callEager(expr: Expr.Apply, args: Value.Base[]): Value.Base {
+    _callEager(expr: Expr.Apply, args: Value.Base[]): Promise<Value.Base> {
         if (args.length !== 2 || expr.arguments.length !== 2) {
             throw new Error("Expected 2 arguments");
         }
@@ -221,7 +226,7 @@ class _At extends EagerFunction {
             if (ans === null) {
                 throw new WDLError.OutOfBounds(expr.arguments[1], "Map key not found");
             }
-            return ans;
+            return Promise.resolve(ans);
         } 
         
         if (lhs instanceof Value.Struct) {
@@ -238,7 +243,7 @@ class _At extends EagerFunction {
             if (skey === null || !(skey in lhs.value)) {
                 throw new WDLError.OutOfBounds(expr.arguments[1], "struct member not found");
             }
-            return lhs.value[skey];
+            return Promise.resolve(lhs.value[skey]);
         } 
         
         const arrayLhs = lhs.coerce(new Type.WDLArray(new Type.Any()));
@@ -253,7 +258,7 @@ class _At extends EagerFunction {
             throw new WDLError.OutOfBounds(expr.arguments[1], "Array index out of bounds");
         }
 
-        return arrayLhs.value[intRhs.value];
+        return Promise.resolve(arrayLhs.value[intRhs.value]);
     }
 }
 function notImpl(...args: any[]): void {
@@ -294,7 +299,7 @@ export class ArithmeticOperator extends EagerFunction {
         return rt;
     }
 
-    _callEager(expr: Expr.Apply, args: Value.Base[]): Value.Base {
+    _callEager(expr: Expr.Apply, args: Value.Base[]): Promise<Value.Base> {
         const ansType = this.inferType(expr);
         const ans = this.op(
             args[0].coerce(ansType).value,
@@ -302,9 +307,9 @@ export class ArithmeticOperator extends EagerFunction {
         );
 
         if (ansType instanceof Type.Int) {
-            return new Value.Int(ans as number);
+            return Promise.resolve(new Value.Int(ans as number));
         }
-        return new Value.Float(ans as number);
+        return Promise.resolve(new Value.Float(ans as number));
     }
 }
 class _AddOperator extends ArithmeticOperator {
@@ -340,7 +345,7 @@ class _AddOperator extends ArithmeticOperator {
         return new Type.String();
     }
 
-    _call_eager(expr: Expr.Apply, args: Value.Base[]): Value.Base {
+    _call_eager(expr: Expr.Apply, args: Value.Base[]): Promise<Value.Base> {
         const ans_type = this.infer_type(expr);
         
         if (!(ans_type instanceof Type.String)) {
@@ -356,7 +361,7 @@ class _AddOperator extends ArithmeticOperator {
             throw new Error("Expected string result from string concatenation");
         }
 
-        return new Value.String(ans);
+        return Promise.resolve(new Value.String(ans));
     }
 }
 class _ComparisonOperator extends EagerFunction {
@@ -411,14 +416,14 @@ class _ComparisonOperator extends EagerFunction {
         return new Type.Boolean();
     }
 
-    _callEager(_: Expr.Apply, args: Value.Base[]): Value.Base {
+    _callEager(_: Expr.Apply, args: Value.Base[]): Promise<Value.Base> {
         if (args.length !== 2) {
             throw new Error("Expected 2 arguments");
         }
 
-        return new Value.Boolean(
+        return Promise.resolve(new Value.Boolean(
             this.op(args[0].value, args[1].value)
-        );
+        ));
     }
 }
 export class And extends WDLFunction {
@@ -439,12 +444,12 @@ export class And extends WDLFunction {
         return new Type.Boolean();
     }
 
-    call(expr: Expr.Apply, env: Env.Bindings<Value.Base>, stdlib: Base): Value.Base {
-        const lhs = expr.arguments[0].eval(env,  stdlib ).expect(new Type.Boolean()).value;
+    async call(expr: Expr.Apply, env: Env.Bindings<Value.Base>, stdlib: Base): Promise<Value.Base> {
+        const lhs = (await expr.arguments[0].eval(env,  stdlib )).expect(new Type.Boolean()).value;
         if (!lhs) {
-            return new Value.Boolean(false);
+            return Promise.resolve(new Value.Boolean(false));
         }
-        return expr.arguments[1].eval(env, stdlib).expect(new Type.Boolean());
+        return Promise.resolve((await expr.arguments[1].eval(env, stdlib)).expect(new Type.Boolean()));
     }
 }
 export class Or extends WDLFunction {
@@ -465,12 +470,12 @@ export class Or extends WDLFunction {
         return new Type.Boolean();
     }
 
-    call(expr: Expr.Apply, env: Env.Bindings<Value.Base>, stdlib: Base): Value.Base {
-        const lhs = expr.arguments[0].eval(env,  stdlib ).expect(new Type.Boolean()).value;
+    async call(expr: Expr.Apply, env: Env.Bindings<Value.Base>, stdlib: Base): Promise<Value.Base> {
+        const lhs = (await expr.arguments[0].eval(env,  stdlib )).expect(new Type.Boolean()).value;
         if (lhs) {
-            return new Value.Boolean(true);
+            return Promise.resolve(new Value.Boolean(true));
         }
-        return expr.arguments[1].eval(env, stdlib).expect(new Type.Boolean());
+        return Promise.resolve((await expr.arguments[1].eval(env, stdlib)).expect(new Type.Boolean()));
     }
 }
 

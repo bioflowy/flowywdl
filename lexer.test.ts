@@ -5,7 +5,7 @@ import { CharStreamImpl, Token } from "antlr4ng";
 import { getTokens, TokenKind } from "./lexer.ts";
 
 Deno.test(function getTokensTest() {
-  const tokens = getTokens(new CharStreamImpl("task test { }"));
+  const tokens = getTokens(new CharStreamImpl("task test { } #test"));
   assertEquals(tokens.kind,TokenKind.TASK);
   assertEquals(tokens.next?.kind,TokenKind.Identifier);
   assertEquals(tokens.next?.next?.kind,TokenKind.LBRACE);

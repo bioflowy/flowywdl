@@ -1,6 +1,6 @@
 import type { Token, TokenPosition } from "typescript-parsec";
-import { WdlV1_1Lexer } from "./generated/WdlV1_1Lexer.ts";
-import { CharStream } from "antlr4ng";
+import { WdlV1_1Lexer, } from "./generated/WdlV1_1Lexer.ts";
+import { CharStream,Token as AntlrToken } from "antlr4ng";
 
 export enum TokenKind {
   LINE_COMMENT = 1,
@@ -141,7 +141,7 @@ export function getTokens(stream: CharStream): WdlToken {
     if (token.type < 0) {
       break;
     }
-    if (token.type === TokenKind.WHITESPACE) {
+    if (token.channel === AntlrToken.HIDDEN_CHANNEL || token.type === TokenKind.LINE_COMMENT) {
       continue;
     }
     const text = token.text||""

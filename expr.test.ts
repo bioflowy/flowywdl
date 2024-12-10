@@ -16,6 +16,11 @@ const dummyPosition: WDLError.SourcePosition ={
     end_column: 1
 };
 Deno.test(function testApply() {
+    const test:string[] = []
+
+    if(test===undefined){
+        console.log("test")
+    }
     const apply = new Expr.Apply(dummyPosition,"_add", [new Expr.IntLiteral(dummyPosition,1), new Expr.IntLiteral(dummyPosition,2)]);
     const stdlib = new Stdlib.Base()
     const typeEnv = new Env.Bindings<Type.Base>();

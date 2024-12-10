@@ -8,6 +8,128 @@ import { calcSHA256 } from "./utils.ts";
 import { WDLArray } from "./type.ts";
 
 
+function _build_workflow_type_env(
+  doc: Document,
+  stdlib: StdLib.Base,
+  checkQuant: boolean,
+  self?: Workflow | WorkflowSection | null,
+  outerTypeEnv?: Env.Bindings<Type.Base> | null
+): void {
+  // Populate each Workflow, Scatter, and Conditional object with its
+  // _type_env attribute containing the type environment available in the body
+  // of the respective section. This is tricky because:
+  // - forward-references to any declaration or call output in the workflow
+  //   are valid, except
+  //   - circular dependencies, direct or indirect
+  //   - (corollary) scatter and conditional expressions can't refer to
+  //     anything within the respective section
+  // - a scatter variable is visible only inside the scatter
+  // - declarations & call outputs of type T within a scatter have type
+  //   Array[T] outside of the scatter
+  // - declarations & call outputs of type T within a conditional have type T?
+  //   outside of the conditional
+  //
+  // preconditions:
+  // - _resolve_calls()
+  //
+  // postconditions:
+  // - typechecks scatter and conditional expressions (recursively)
+  // - sets _type_env attributes on each Workflow/Scatter/Conditional
+  assert(doc.workflow);
+  self = self || doc.workflow;
+  if (!self) {
+      return;
+  }
+  assert(self instanceof WorkflowSection || self === doc.workflow);
+  assert(self._type_env === undefined);
+
+  // When we've been called recursively on a scatter or conditional section,
+  // the 'outer' type environment has everything available in the workflow
+  // -except- the body of self.
+  let typeEnv = outerTypeEnv || new Env.Bindings();
+
+  if (self instanceof Workflow) {
+      // start with workflow inputs
+      for (const decl of self.inputs || []) {
+          typeEnv = decl.add_to_type_env(doc._struct_types, typeEnv);
+      }
+  } else if (self instanceof Scatter) {
+      // typecheck scatter array
+      self.expr.inferType(
+          typeEnv,
+          stdlib,checkQuant,doc._struct_types
+      );
+      if (!(self.expr.type instanceof Type.WDLArray)) {
+          throw new WDLError.NotAnArray(self.expr);
+      }
+      if (self.expr.type.itemType instanceof Type.Any) {
+          throw new WDLError.IndeterminateType(self.expr, "can't infer item type of empty array");
+      }
+      // bind the scatter variable to the array item type within the body
+      if (typeEnv.hasBinding(self.variable)) {
+          throw new WDLError.MultipleDefinitions(
+              self,
+              "Name collision for scatter variable " + self.variable
+          );
+      }
+      if (typeEnv.hasNamespace(self.variable)) {
+          throw new WDLError.MultipleDefinitions(
+              self,
+              "Call name collision for scatter variable " + self.variable
+          );
+      }
+      typeEnv = typeEnv.bind(self.variable, self.expr.type.itemType, self);
+  } else if (self instanceof Conditional) {
+      // typecheck the condition
+      self.expr.inferType(
+          typeEnv,
+          stdlib,
+          checkQuant,
+          doc._struct_types
+      );
+      if (!self.expr.type.coerces(new Type.Boolean())) {
+          throw new WDLError.StaticTypeMismatch(self.expr, new Type.Boolean(), self.expr.type);
+      }
+  } else {
+      assert(false);
+  }
+
+  // descend into child scatter & conditional elements, if any.
+  for (const child of self.body) {
+      if (child instanceof WorkflowSection) {
+          // prepare the 'outer' type environment for the child element, by
+          // adding all its sibling declarations and call outputs
+          let childOuterTypeEnv = typeEnv;
+          for (const sibling of self.body) {
+              if (sibling !== child) {
+                  childOuterTypeEnv = sibling.add_to_type_env(
+                      doc._struct_types,
+                      childOuterTypeEnv
+                  );
+              }
+          }
+          _build_workflow_type_env(doc, stdlib, checkQuant, child, childOuterTypeEnv);
+      } else if (child instanceof Decl && !child.type.optional && !child.expr) {
+          if (doc.workflow.inputs !== null) {
+              throw new WDLError.StrayInputDeclaration(
+                  self,
+                  `unbound non-optional declaration ${child.type.toString()} ${child.name} outside workflow input{} section`
+              );
+          } else if (!(self instanceof Workflow)) {
+              throw new WDLError.StrayInputDeclaration(
+                  self,
+                  `unbound non-optional declaration ${child.type.toString()} ${child.name} inside scatter/conditional section`
+              );
+          }
+      }
+  }
+
+  // finally, populate self._type_env with all our children
+  for (const child of self.body) {
+      typeEnv = child.add_to_type_env(doc._struct_types, typeEnv);
+  }
+  self._type_env = typeEnv;
+}
 export class StructTypeDef extends WDLError.SourceNode {
   name: string;
   members: Record<string, Type.Base>;
@@ -31,17 +153,17 @@ export class StructTypeDef extends WDLError.SourceNode {
 }
 
 export abstract class WorkflowNode extends WDLError.SourceNode {
-  workflow_node_id: string;
-  scatter_depth: number;
+  workflowNodeId: string;
+  scatterDepth: number;
   private _memo_workflow_node_dependencies?: Set<string>;
 
   constructor(workflow_node_id: string, pos: WDLError.SourcePosition) {
     super(pos);
-    this.workflow_node_id = workflow_node_id;
-    this.scatter_depth = 0;
+    this.workflowNodeId = workflow_node_id;
+    this.scatterDepth = 0;
   }
 
-  get workflow_node_dependencies(): Set<string> {
+  get workflowNodeDependencies(): Set<string> {
     if (!this._memo_workflow_node_dependencies) {
       this._memo_workflow_node_dependencies = new Set(
         this._workflow_node_dependencies()
@@ -63,8 +185,113 @@ export abstract class WorkflowNode extends WDLError.SourceNode {
         ch._increment_scatter_depth();
       }
     }
-    this.scatter_depth++;
+    this.scatterDepth++;
   }
+}
+function _translate_struct_mismatch<T>(doc: Document, exc:WDLError.StaticTypeMismatch):WDLError.StaticTypeMismatch {
+  // When we get a StaticTypeMismatch error during workflow typechecking,
+  // which involves a struct type imported from another document, the error
+  // message may require translation from the struct type's original name
+  // within in the imported document to its aliased name in the current
+  // document.
+  let expected : Type.StructInstance|undefined = undefined
+  if (exc.expected instanceof Type.StructInstance) {
+    expected = exc.expected;
+      for (const stb of doc.struct_typedefs) {
+          assert(stb instanceof Env.Binding);
+          assert(stb.value instanceof StructTypeDef);
+          if (Object.is(stb.value.members, expected.members)) {
+              expected = new Type.StructInstance(stb.name, 
+                  expected.optional 
+              );
+              expected.members = stb.value.members;
+          }
+      }
+  }
+  let actual : Type.StructInstance|undefined = undefined
+  if (exc.actual instanceof Type.StructInstance) {
+    actual = exc.actual;
+    for (const stb of doc.struct_typedefs) {
+          assert(stb instanceof Env.Binding);
+          assert(stb.value instanceof StructTypeDef);
+          if (Object.is(stb.value.members, actual.members)) {
+              actual = new Type.StructInstance(stb.name, actual.optional );
+              actual.members = stb.value.members;
+          }
+      }
+  }
+  assert(expected!==undefined && actual!==undefined)
+  return new WDLError.StaticTypeMismatch(
+      exc.node,
+      expected,
+      actual,
+      exc.message
+  );
+}
+async function _typecheck_workflow_body(
+  doc: Document,
+  stdlib: StdLib.Base,
+  checkQuant: boolean,
+  self?: Workflow | WorkflowSection | null
+): Promise<boolean> {
+  // following _resolve_calls() and _build_workflow_type_env(), typecheck all
+  // the declaration expressions and call inputs
+  self = self || doc.workflow;
+  assert(self && self._type_env !== null);
+  let completeCalls = true;
+
+  const errors = new WDLError.MultiContext();
+  try {
+      for (const child of self.body) {
+          if (child instanceof Decl) {
+            try{
+              child.typecheck(
+                self!._type_env!,
+                stdlib,doc._struct_types,checkQuant)
+            }catch(error){
+              if(error instanceof WDLError.StaticTypeMismatch){
+                throw _translate_struct_mismatch(doc,error)
+              }
+              throw error;
+            }
+      } else if (child instanceof Call) {
+            const rslt = errors.try1(()=>{
+              try{
+                return child.typecheck_input(
+                  doc._struct_types,
+                  self!._type_env!,
+                  stdlib,
+                  checkQuant
+                ) === false
+              }catch(error){
+                if(error instanceof WDLError.StaticTypeMismatch){
+                  throw _translate_struct_mismatch(doc,error)
+                }
+                throw error;
+
+              }
+          })
+          if (rslt) {
+                  completeCalls = false;
+              }
+          } else if (child instanceof WorkflowSection) {
+            const rslt = await _typecheck_workflow_body(
+              doc,
+              stdlib,
+              checkQuant,
+              child)
+            if(rslt){
+              completeCalls = false;
+            }
+          } else {
+              assert(false);
+          }
+      }
+  } finally {
+      errors.maybeRaise()
+  }
+
+  return completeCalls;
 }
 /**
  * Position and text of a comment. The text includes the ``#`` and any preceding or trailing
@@ -75,12 +302,12 @@ interface SourceComment {
   text: string;
 }
 
-interface DocImport {
+export interface DocImport {
   pos: WDLError.SourcePosition;
   uri: string;
   namespace: string;
-  aliases: [string, string][]; // List[Tuple[str, str]] をTypeScriptの配列型に変換
-  doc: Document | null; // Optional[Document] を union type に変換
+  aliases: [string, string][];
+  doc: Document | null;
 }
 function _check_serializable_map_keys(
   t: Type.Base,
@@ -190,7 +417,7 @@ export class Task extends WDLError.SourceNode {
    *
    * Each input is at the top level of the Env, with no namespace.
    */
-  get available_inputs(): Env.Bindings<Decl> {
+  get availableInputs(): Env.Bindings<Decl> {
     let ans: Env.Bindings<Decl> = new Env.Bindings();
 
     if (
@@ -218,7 +445,7 @@ export class Task extends WDLError.SourceNode {
    */
   get required_inputs(): Env.Bindings<Decl> {
     let ans: Env.Bindings<Decl> = new Env.Bindings();
-    for (const b of [...this.available_inputs].reverse()) {
+    for (const b of [...this.availableInputs].reverse()) {
       const d: Decl = b.value;
       if (
         d.expr === null &&
@@ -238,7 +465,7 @@ export class Task extends WDLError.SourceNode {
    * no namespace. (Present for isomorphism with
    * ``Workflow.effective_outputs``)
    */
-  get effective_outputs(): Env.Bindings<Type.Base> {
+  get effectiveOutputs(): Env.Bindings<Type.Base> {
     let ans: Env.Bindings<Type.Base> = new Env.Bindings();
     for (const decl of [...this.outputs].reverse()) {
       ans = ans.bind(decl.name, decl.type, decl);
@@ -304,7 +531,7 @@ export class Task extends WDLError.SourceNode {
           .typecheck(new Type.String());
       });
   
-      for (const b of this.available_inputs) {
+      for (const b of this.availableInputs) {
         errors.try1(() =>
           _check_serializable_map_keys(b.value.type, b.name, b.value)
         );
@@ -449,7 +676,7 @@ export class Call extends WorkflowNode {
         wf.name === this.callee_id[this.callee_id.length - 1]
       ) {
         if (callee_doc === doc) throw new WDLError.CircularDependencies(this);
-        if (!wf.compconste_calls || (!wf.outputs && wf.effective_outputs))
+        if (!wf.complete_calls || (!wf.outputs && wf.effectiveOutputs))
           throw new WDLError.UncallableWorkflow(this, this.callee_id.join("."));
         this.callee = wf;
       } else {
@@ -492,7 +719,7 @@ export class Call extends WorkflowNode {
       );
 
     return Env.merge(
-      this.effective_outputs,
+      this.effectiveOutputs,
       type_env.bind(this.name + "." + "_present", new Type.Any(), this)
     );
   }
@@ -523,7 +750,7 @@ export class Call extends WorkflowNode {
     const all_required_inputsProvided = true;
     WDLError.multiContext((errors) => {
     for (const [name, expr] of Object.entries(this.inputs)) {
-      const decl = this.callee?.available_inputs.get(name);
+      const decl = this.callee?.availableInputs.get(name);
       if (!decl) {
         errors.append(new WDLError.NoSuchInput(expr, name));
       }else{
@@ -542,11 +769,11 @@ export class Call extends WorkflowNode {
   return required_inputs.size === 0;
 }
 
-  get available_inputs(): Env.Bindings<Decl> {
+  get availableInputs(): Env.Bindings<Decl> {
     if (!this.callee) throw new Error("Callee not resolved");
 
     const supplied_inputs = new Set(Object.keys(this.inputs));
-    return this.callee.available_inputs
+    return this.callee.availableInputs
       .filter((b) => !supplied_inputs.has(b.name))
       .wrapNamespace(this.name);
   }
@@ -560,11 +787,11 @@ export class Call extends WorkflowNode {
       .wrapNamespace(this.name);
   }
 
-  get effective_outputs(): Env.Bindings<Type.Base> {
+  get effectiveOutputs(): Env.Bindings<Type.Base> {
     if (!this.callee) throw new Error("Callee not resolved");
 
     let ans = new Env.Bindings<Type.Base>();
-    for (const outp of [...this.callee.effective_outputs].reverse()) {
+    for (const outp of [...this.callee.effectiveOutputs].reverse()) {
       ans = ans.bind(this.name + "." + outp.name, outp.value, this);
     }
     return ans;
@@ -583,8 +810,9 @@ export class Call extends WorkflowNode {
     }.call(this);
   }
 }
+
 function assert(
-  condition: any,
+  condition: unknown,
   message: string = "Assertion failed"
 ): asserts condition {
   if (!condition) {
@@ -601,6 +829,18 @@ function* _calls(element: Workflow | WorkflowSection): Generator<Call> {
     }
   }
 }
+function _resolve_calls(doc: Document) {
+    // Resolve all calls in the workflow (descending into scatter & conditional
+    // sections).
+    const wf = doc.workflow
+    if(wf!==null){
+        WDLError.multiContext((errors)=>{
+            for(const c of _calls(wf)){
+                errors.try1(()=> c.resolve(doc))
+            }
+          })
+    }
+  }
 function reverse<T>(gen: Generator<T>): Generator<T> {
   // Generatorの出力を配列に格納
   const items = [...gen];
@@ -619,12 +859,19 @@ export class Workflow extends WDLError.SourceNode {
   outputs: Decl[];
   _output_idents: string[][];
   _output_idents_pos: WDLError.SourcePosition | undefined;
-  parameter_meta: { [key: string]: any }; // Dict<string, any>
-  meta: { [key: string]: any }; // Dict<string, any>
+  parameter_meta: { [key: string]: unknown }; // Dict<string, any>
+  meta: { [key: string]: unknown }; // Dict<string, any>
   _type_env: Env.Bindings<Type.Base> | undefined = undefined;
-  compconste_calls: boolean;
+  /**
+   * After typechecking: the type environment in the main workflow body,
+    - declarations at the top level of the workflow body
+    - outputs of calls at the top level the workflow body
+    - declarations & outputs inside scatter sections (as arrays)
+    - declarations & outputs inside conditional sections (as optionals)
+   */
+  complete_calls: boolean;
   _nodes_by_id: { [key: string]: WorkflowNode } = {};
-  effective_wdl_version: string;
+  effectiveWdlVersion: string;
 
   constructor(
     pos: WDLError.SourcePosition,
@@ -632,8 +879,8 @@ export class Workflow extends WDLError.SourceNode {
     inputs: Decl[],
     body: WorkflowNode[],
     outputs: Decl[],
-    parameter_meta: { [key: string]: any },
-    meta: { [key: string]: any },
+    parameter_meta: { [key: string]: unknown },
+    meta: { [key: string]: unknown },
     output_idents: string[][] | undefined = [],
     output_idents_pos: WDLError.SourcePosition | undefined = undefined
   ) {
@@ -646,22 +893,22 @@ export class Workflow extends WDLError.SourceNode {
     this._output_idents_pos = output_idents_pos;
     this.parameter_meta = parameter_meta;
     this.meta = meta;
-    this.compconste_calls = true;
-    this.effective_wdl_version = ""; // overridden by Document.__init__
+    this.complete_calls = true;
+    this.effectiveWdlVersion = ""; // overridden by Document.__init__
 
     for (const output_decl of this.outputs || []) {
-      output_decl.workflow_node_id = output_decl.workflow_node_id.replace(
+      output_decl.workflowNodeId = output_decl.workflowNodeId.replace(
         "decl-",
         "output-"
       );
     }
   }
 
-  get available_inputs(): Env.Bindings<Decl> {
+  get availableInputs(): Env.Bindings<Decl> {
     let ans = new Env.Bindings<Decl>();
 
     for (const c of reverse(_calls(this))) {
-      ans = Env.merge(c.available_inputs, ans);
+      ans = Env.merge(c.availableInputs, ans);
     }
 
     if (this.inputs !== undefined) {
@@ -686,7 +933,7 @@ export class Workflow extends WDLError.SourceNode {
       ans = Env.merge(c.required_inputs, ans);
     }
 
-    for (const b of this.available_inputs) {
+    for (const b of this.availableInputs) {
       if (!b.name.includes(".")) {
         const d = b.value;
         if (d instanceof Decl && !d.type.optional && !d.expr) {
@@ -698,7 +945,7 @@ export class Workflow extends WDLError.SourceNode {
     return ans;
   }
 
-  get effective_outputs(): Env.Bindings<Type.Base> {
+  get effectiveOutputs(): Env.Bindings<Type.Base> {
     let ans = new Env.Bindings<Type.Base>();
 
     if (this.outputs !== undefined) {
@@ -708,7 +955,7 @@ export class Workflow extends WDLError.SourceNode {
     } else {
       for (const elt of this.body.reverse()) {
         if (elt instanceof Call || elt instanceof WorkflowSection) {
-          ans = Env.merge(elt.effective_outputs, ans);
+          ans = Env.merge(elt.effectiveOutputs, ans);
         }
       }
     }
@@ -724,10 +971,95 @@ export class Workflow extends WDLError.SourceNode {
     return children;
   }
 
-  typecheck(doc: Document, check_quant: boolean): void {
-    // implementation here remains the same with conversion to TypeScript syntax
-  }
+  async typecheck(doc: Document, checkQuant: boolean): Promise<void> {
+    assert(doc.workflow === this);
+    
+    // 1. resolve all calls and check for call name collisions
+    _resolve_calls(doc);
+    
+    // 2. build type environments in the workflow and each scatter &
+    //    conditional section therein
+    const stdlib = new StdLib.Base(this.effectiveWdlVersion);
+    _build_workflow_type_env(doc, stdlib, checkQuant);
+    if(this._type_env === undefined){
+      throw new Error("unexpected")
+    }
+    
+    const errors = new WDLError.MultiContext();
+    try {
+        // 3. typecheck the right-hand side expressions of each declaration
+        //    and the inputs to each call (descending into scatter & conditional
+        //    sections)
+        for (const decl of this.inputs || []) {
+            errors.try1(
+                () => decl.typecheck(
+                        this._type_env!,
+                        stdlib,doc._struct_types,checkQuant))
+        }
 
+        if (await errors.try1(() => _typecheck_workflow_body(doc, stdlib, checkQuant)) === false) {
+            this.complete_calls = false;
+        }
+
+        for (const b of this.availableInputs) {
+            errors.try1(() => _check_serializable_map_keys(b.value.type, b.name, b.value));
+        }
+
+        // 4. convert deprecated output_idents, if any, to output declarations
+        if (this._output_idents) {
+            this._rewrite_output_idents();
+        }
+
+        // 5. typecheck the output expressions
+        if (this.outputs) {
+            const outputNames: Set<string> = new Set();
+            const outputTypeEnv = this._type_env;
+            assert(outputTypeEnv !== null);
+
+            for (const output of this.outputs) {
+                assert(output.expr);
+                if (outputNames.has(output.name)) {
+                    errors.append(
+                        new WDLError.MultipleDefinitions(
+                            output ,
+                            "multiple workflow outputs named " + output.name
+                        )
+                    );
+                }
+                outputNames.add(output.name);
+
+                // tricky sequence here: we need to call Decl.add_to_type_env to resolve
+                // potential struct type, but:
+                // 1. we may not want it to check for name collision in the usual way in order to
+                //    handle a quirk of draft-2 workflow output style, where an output may take
+                //    the name of another decl in the workflow. Instead we've tracked and
+                //    rejected any duplicate names among the workflow outputs.
+                // 2. we still want to typecheck the output expression againsnt the 'old' type
+                //    environment
+                const outputTypeEnv2 = output.add_to_type_env(
+                    doc._struct_types,
+                    outputTypeEnv,
+                   (output as any)._rewritten_ident || false 
+                );
+
+                errors.try1(
+                    () => output.typecheck(
+                        outputTypeEnv,
+                        stdlib,doc._struct_types,checkQuant)
+                );
+
+                errors.try1(
+                    () => _check_serializable_map_keys(output.type, output.name, output)
+                );
+            }
+        }
+    } finally {
+         errors.maybeRaise();
+    }
+
+    // 6. check for cyclic dependencies
+    _detect_cycles(_workflow_dependency_matrix(this));
+}
   _rewrite_output_idents(): void {
     assert(this._type_env !== undefined);
 
@@ -784,11 +1116,11 @@ export class Workflow extends WDLError.SourceNode {
     this._output_idents = [];
   }
 
-  get_node(workflow_node_id: string): WorkflowNode {
+  getNode(workflow_node_id: string): WorkflowNode {
     if (!this._nodes_by_id) {
       const visit = (node: WDLError.SourceNode): void => {
         if (node instanceof WorkflowNode) {
-          this._nodes_by_id[node.workflow_node_id] = node;
+          this._nodes_by_id[node.workflowNodeId] = node;
           for (const ch of node.children) {
             visit(ch);
           }
@@ -857,7 +1189,7 @@ export class Gather extends WorkflowNode {
    */
 
   constructor(section: WorkflowSection, referee: Decl | Call | Gather) {
-    super("gather-" + referee.workflow_node_id, referee.pos);
+    super("gather-" + referee.workflowNodeId, referee.pos);
     this.section = section;
     this.referee = referee;
   }
@@ -871,7 +1203,7 @@ export class Gather extends WorkflowNode {
 
   _workflow_node_dependencies(): Iterable<string> {
     return function* (this: Gather) {
-      yield this.referee.workflow_node_id;
+      yield this.referee.workflowNodeId;
     }.call(this);
   }
 
@@ -879,7 +1211,7 @@ export class Gather extends WorkflowNode {
     return []
   }
 
-  get final_referee(): Decl | Call {
+  get finalReferee(): Decl | Call {
     /**
      * The `Decl` or `Call` node found at the end of the referee chain through any nested
      * `Gather` nodes
@@ -895,7 +1227,7 @@ export class Gather extends WorkflowNode {
   }
 }
 
-abstract class WorkflowSection extends WorkflowNode {
+export abstract class WorkflowSection extends WorkflowNode {
   /**
    * Base class for workflow nodes representing scatter and conditional sections
    */
@@ -920,10 +1252,10 @@ abstract class WorkflowSection extends WorkflowNode {
     this.gathers = {};
     for (const elt of this.body) {
       if (elt instanceof Decl || elt instanceof Call) {
-        this.gathers[elt.workflow_node_id] = new Gather(this, elt);
+        this.gathers[elt.workflowNodeId] = new Gather(this, elt);
       } else if (elt instanceof WorkflowSection) {
         for (const subgather of Object.values(elt.gathers)) {
-          this.gathers[subgather.workflow_node_id] = new Gather(
+          this.gathers[subgather.workflowNodeId] = new Gather(
             this,
             subgather
           );
@@ -939,7 +1271,7 @@ abstract class WorkflowSection extends WorkflowNode {
     return children;
   }
 
-  abstract get effective_outputs(): Env.Bindings<Type.Base>;
+  abstract get effectiveOutputs(): Env.Bindings<Type.Base>;
 }
 
 export class Scatter extends WorkflowSection {
@@ -995,14 +1327,14 @@ export class Scatter extends WorkflowSection {
     return Env.merge(inner_type_env.map(arrayize), type_env);
   }
 
-  get effective_outputs(): Env.Bindings<Type.Base> {
+  get effectiveOutputs(): Env.Bindings<Type.Base> {
     const nonempty =
       this.expr.type instanceof WDLArray && this.expr.type.nonempty;
     let inner_outputs = new Env.Bindings<Type.Base>();
     for (const elt of this.body) {
       if (!(elt instanceof Decl)) {
         if(elt instanceof Call ||elt instanceof Scatter || elt instanceof Conditional){
-          inner_outputs = Env.merge(elt.effective_outputs, inner_outputs);
+          inner_outputs = Env.merge(elt.effectiveOutputs, inner_outputs);
         }
       }
     }
@@ -1068,11 +1400,11 @@ export class Conditional extends WorkflowSection {
     return Env.merge(inner_type_env.map(optionalize), type_env);
   }
 
-  get effective_outputs(): Env.Bindings<Type.Base> {
+  get effectiveOutputs(): Env.Bindings<Type.Base> {
     let inner_outputs = new Env.Bindings<Type.Base>();
     for (const elt of this.body) {
       if (elt instanceof Call || elt instanceof WorkflowSection) {
-        inner_outputs = Env.merge(elt.effective_outputs, inner_outputs);
+        inner_outputs = Env.merge(elt.effectiveOutputs, inner_outputs);
       }
     }
 
@@ -1099,7 +1431,7 @@ export class Conditional extends WorkflowSection {
  * struct type aliases, and (after typechecking) the ``Document`` object.
  */
 
-class Document extends WDLError.SourceNode {
+export class Document extends WDLError.SourceNode {
   /**
    * Top-level document, with imports, tasks, and up to one workflow. Typically returned by
    * :func:`~WDL.load`.
@@ -1156,7 +1488,7 @@ class Document extends WDLError.SourceNode {
   struct_typedefs: Env.Bindings<StructTypeDef>;
 
   // simpler mapping of struct names to their members, used for typechecking ops
-  private _struct_types: Env.Bindings<{ [key: string]: Type.Base }>;
+  _struct_types: Env.Bindings<{ [key: string]: Type.Base }>;
 
   /**
    * :type: List[WDL.Tree.Task]
@@ -1200,7 +1532,7 @@ class Document extends WDLError.SourceNode {
       task.effective_wdl_version = this.effective_wdl_version;
     }
     if (this.workflow) {
-      this.workflow.effective_wdl_version = this.effective_wdl_version;
+      this.workflow.effectiveWdlVersion = this.effective_wdl_version;
     }
 
     for (const comment of comments) {
@@ -1236,7 +1568,7 @@ class Document extends WDLError.SourceNode {
    *
    * Documents returned by :func:`~WDL.load` have already been typechecked.
    */
-  typecheck(check_quant: boolean = true): void {
+  async typecheck(check_quant: boolean = true): Promise<void> {
     const names = new Set<string>();
     for (const imp of this.imports) {
       if (names.has(imp.namespace)) {
@@ -1281,7 +1613,7 @@ class Document extends WDLError.SourceNode {
           "Workflow name collides with a task also named " + this.workflow.name
         );
       }
-      this.workflow.typecheck(this, check_quant);
+      await this.workflow.typecheck(this, check_quant);
     }
   }
 }
@@ -1364,15 +1696,12 @@ export class Decl extends WorkflowNode {
   }
 
   protected *_workflow_node_dependencies(): Generator<string> {
-    if (!this.expr){
-      throw new Error("Expected expression");
-    }
     yield* _expr_workflow_node_dependencies(this.expr);
   }
 }
 
 function* _expr_workflow_node_dependencies(
-  expr: Expr.Base | null
+  expr: Expr.Base | undefined
 ): Iterable<string> {
   // Given some Expr within a workflow, yield the workflow node IDs of the referees of each
   // Expr.Ident subexpression. These referees can include
@@ -1384,7 +1713,7 @@ function* _expr_workflow_node_dependencies(
     if (!(expr.referee instanceof WorkflowNode))
       throw new Error("Expected WorkflowNode referee");
     if (!(expr.referee instanceof WorkflowSection)) {
-      yield expr.referee.workflow_node_id;
+      yield expr.referee.workflowNodeId;
     }
   }
   for (const ch of expr?.children || []) {
@@ -1393,13 +1722,13 @@ function* _expr_workflow_node_dependencies(
   }
 }
 
-function _decl_dependency_matrix(
+export function _decl_dependency_matrix(
   decls: Decl[]
 ): [Record<string, Decl>, Util.AdjM<string>] {
   // Given decls (e.g. in a task), produce mapping of workflow node id to the objects, and the
   // AdjM of their dependencies (edge from o1 to o2 = o2 depends on o1)
   const objs_by_id: Record<string, Decl> = Object.fromEntries(
-    decls.map((decl) => [decl.workflow_node_id, decl])
+    decls.map((decl) => [decl.workflowNodeId, decl])
   );
   if (Object.keys(objs_by_id).length !== decls.length)
     throw new Error("Duplicate workflow node IDs in decls");
@@ -1407,9 +1736,9 @@ function _decl_dependency_matrix(
   const adj = new Util.AdjM<string>();
 
   for (const obj of decls) {
-    const oid = obj.workflow_node_id;
+    const oid = obj.workflowNodeId;
     adj.add_node(oid);
-    for (const dep_id of obj.workflow_node_dependencies) {
+    for (const dep_id of obj.workflowNodeDependencies) {
       if (dep_id in objs_by_id) adj.add_edge(dep_id, oid);
     }
   }
@@ -1429,16 +1758,16 @@ function _workflow_dependency_matrix(
   const adj = new Util.AdjM<string>();
 
   function visit(obj: WorkflowNode): void {
-    const oid = obj.workflow_node_id;
+    const oid = obj.workflowNodeId;
     objs_by_id[oid] = obj;
     adj.add_node(oid);
     if (obj instanceof WorkflowSection) {
       for (const ch of [...obj.body, ...Object.values(obj.gathers)]) {
         visit(ch);
-        adj.add_edge(oid, ch.workflow_node_id);
+        adj.add_edge(oid, ch.workflowNodeId);
       }
     }
-    for (const dep_id of obj.workflow_node_dependencies) {
+    for (const dep_id of obj.workflowNodeDependencies) {
       adj.add_edge(dep_id, oid);
     }
   }
@@ -1640,8 +1969,8 @@ function _describe_struct_types(exe: Task | Workflow): { [key: string]: string }
           items.push(...item.children);
       }
       else if (item instanceof Call) {
-          items.push(...item.available_inputs);
-          for (const b of item.effective_outputs) {
+          items.push(...item.availableInputs);
+          for (const b of item.effectiveOutputs) {
               items.push(b.value);
           }
       }
